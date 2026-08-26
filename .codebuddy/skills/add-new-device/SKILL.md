@@ -30,7 +30,9 @@ description: 当需要修改本 ROTHKO_Twrp 项目以支持/新增其他 Android
 - **DEVICE_NAME**：机型代号（即 `out/target/product/<DEVICE_NAME>` 目录名）。
 - **MAKEFILE_NAME**：lunch 目标名，格式 `twrp_<代号>`。
 - **COMMON_TREE_URL / COMMON_PATH**（可选）：公共设备树（如骁龙平台 common），无则留空。
-- **BUILD_TARGET**（默认 `recovery`）：编译目标分区，可选 `boot`/`recovery`/`vendorboot`。
+- **BUILD_TARGET**：原本为编译目标分区（`boot`/`recovery`/`vendorboot`），但本仓库工作流已写死
+  为 `make recoveryimage vendorbootimage`（一次构建同时产出 `recovery.img` 与 `vendor_boot.img`），
+  故该 input 仅作说明性参数保留，不再驱动实际构建目标。
 
 ### 2. 编辑工作流文件
 打开 `.github/workflows/Recovery Build.yml`，定位 `on.workflow_dispatch.inputs` 段
