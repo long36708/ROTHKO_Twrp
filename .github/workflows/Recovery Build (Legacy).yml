@@ -114,7 +114,15 @@ jobs:
       
     - name: Clone device tree
       run: |
-        git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
+        git clone ${{ github.event.inputs.DEVICE_TREE_URL } -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Register lunch combo
+      run: |
+        echo "add_lunch_combo ${{ github.event.inputs.MAKEFILE_NAME }}-eng" > ./${{ github.event.inputs.DEVICE_PATH }}/vendorsetup.mk
+        echo "::group::Generated vendorsetup.mk"
+        cat ./${{ github.event.inputs.DEVICE_PATH }}/vendorsetup.mk
+        echo "::endgroup::"
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Clone common tree
