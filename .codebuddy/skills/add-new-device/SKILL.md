@@ -45,15 +45,24 @@ description: 当需要修改本 ROTHKO_Twrp 项目以支持/新增其他 Android
 （见 workflow 第 130–143 行）。较新分支的设备树应使用 `omni.dependencies` 命名，
 否则依赖同步会被跳过（该步 `continue-on-error: true`，仅告警）。
 
-**已知坑：Invalid lunch combo**。部分 TWRP 设备树只在 `AndroidProducts.mk` 里用
-`COMMON_LUNCH_CHOICES := twrp_<代号>-eng` 声明 lunch，没有 `vendorsetup.mk` 调用
-`add_lunch_combo`。当 `envsetup.sh` 未扫描到该 combo 时会报
-`Invalid lunch combo: twrp_<代号>-eng`。本项目工作流采用双保险：
-1）`Clone device tree` 后生成 `device/<品牌>/<代号>/vendorsetup.mk` 写入 `add_lunch_combo`；
-2）`Building recovery` 步骤在 `source build/envsetup.sh` 之后、同一 shell 内直接调用
-`add_lunch_combo ${{ MAKEFILE_NAME }}-eng` 再 `lunch`，绕过 envsetup 对 `AndroidProducts.mk`
-的扫描，确保 combo 一定进入菜单。**新增机型若仍报此错，说明设备树
-`twrp_<代号>.mk` 继承链（如 `vendor/twrp/config/common.mk`、`device.mk`）解析失败，需检查 repo sync 是否拉全 vendor/twrp 及依赖。**
+**已知坑：Invalid lunch combo（新版源码三段式）**。当 `MANIFEST_BRANCH` 指向较新的
+TWRP/AOSP 源码（如 `twrp-14.1` ≈ Android 15）时，`lunch` 目标格式已强制为
+`<product>-<release>-<variant>` **三段式**，旧的两段式 `twrp_<代号>-eng` 会报
+`Invalid lunch combo` 且 `add_lunch_combo` 函数已 `obsolete`。
+
+根因在**设备树**，不在编译模板：设备树的 `AndroidProducts.mk` 仍写两段式
+`COMMON_LUNCH_CHOICES := twrp_<代号>-eng`。修复必须改**上游设备树仓库**（CI 用
+`git clone` 远程，改本地副本须 `git push` 回远程才生效）：
+
+1. 设备树 `AndroidProducts.mk`：
+   `COMMON_LUNCH_CHOICES := twrp_<代号>-trunk_staging-eng`
+   （`trunk_staging` 为新版 AOSP 默认 release config；`<代号>` 与 `twrp_<代号>.mk` 的
+   `PRODUCT_NAME` 一致。`vendorsetup.sh` 若无则不用加——新版已废弃 `add_lunch_combo`。）
+2. 本仓库工作流 `MAKEFILE_NAME` 默认改为 `twrp_<代号>-trunk_staging`（使
+   `lunch ${{ MAKEFILE_NAME }}-eng` = 三段式目标）。
+
+注意：本项目工作流的 `Building recovery` 步骤**不要**再调用 `add_lunch_combo`
+（新版 obsolete，会触发警告），也不要在 clone 后生成 `vendorsetup.mk`。
 `twrp-11`/`twrp-12.1` → `twrp.dependencies`，其余分支 → `omni.dependencies`
 （见 workflow 第 130–143 行）。较新分支的设备树应使用 `omni.dependencies` 命名，
 否则依赖同步会被跳过（该步 `continue-on-error: true`，仅告警）。
