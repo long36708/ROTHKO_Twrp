@@ -156,6 +156,7 @@ jobs:
     - name: Building recovery
       run: |
         source build/envsetup.sh
+        add_lunch_combo ${{ github.event.inputs.MAKEFILE_NAME }}-eng
         export ALLOW_MISSING_DEPENDENCIES=true
         lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng && make clean && make recoveryimage vendorbootimage -j$(nproc --all)
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}

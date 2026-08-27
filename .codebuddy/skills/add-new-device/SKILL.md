@@ -48,9 +48,12 @@ description: 当需要修改本 ROTHKO_Twrp 项目以支持/新增其他 Android
 **已知坑：Invalid lunch combo**。部分 TWRP 设备树只在 `AndroidProducts.mk` 里用
 `COMMON_LUNCH_CHOICES := twrp_<代号>-eng` 声明 lunch，没有 `vendorsetup.mk` 调用
 `add_lunch_combo`。当 `envsetup.sh` 未扫描到该 combo 时会报
-`Invalid lunch combo: twrp_<代号>-eng`。本项目工作流已在 `Clone device tree` 后追加
-`Register lunch combo` 步骤，自动生成 `vendorsetup.mk` 写入
-`add_lunch_combo ${{ MAKEFILE_NAME }}-eng`，作为双保险。**新增机型若报此错，先确认该步骤是否执行。**
+`Invalid lunch combo: twrp_<代号>-eng`。本项目工作流采用双保险：
+1）`Clone device tree` 后生成 `device/<品牌>/<代号>/vendorsetup.mk` 写入 `add_lunch_combo`；
+2）`Building recovery` 步骤在 `source build/envsetup.sh` 之后、同一 shell 内直接调用
+`add_lunch_combo ${{ MAKEFILE_NAME }}-eng` 再 `lunch`，绕过 envsetup 对 `AndroidProducts.mk`
+的扫描，确保 combo 一定进入菜单。**新增机型若仍报此错，说明设备树
+`twrp_<代号>.mk` 继承链（如 `vendor/twrp/config/common.mk`、`device.mk`）解析失败，需检查 repo sync 是否拉全 vendor/twrp 及依赖。**
 `twrp-11`/`twrp-12.1` → `twrp.dependencies`，其余分支 → `omni.dependencies`
 （见 workflow 第 130–143 行）。较新分支的设备树应使用 `omni.dependencies` 命名，
 否则依赖同步会被跳过（该步 `continue-on-error: true`，仅告警）。
