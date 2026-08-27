@@ -14,7 +14,7 @@ on:
       DEVICE_TREE_URL:
         description: 'DEVICE_TREE_URL'
         required: true
-        default: 'https://github.com/long36708/device_vivo_PD2415-TWRP'
+        default: 'https://github.com/long36708/device_vivo_pd2415_twrp'
       DEVICE_TREE_BRANCH:
         description: 'DEVICE_TREE_BRANCH'
         required: true
@@ -22,7 +22,7 @@ on:
       DEVICE_PATH:
         description: 'DEVICE_PATH'
         required: true
-        default: 'device/vivo/PD2415'
+        default: 'device/vivo/pd2415'
       COMMON_TREE_URL:
         description: 'COMMON_TREE_URL (if no common tree, leave blank)'
         required: false
@@ -32,11 +32,11 @@ on:
       DEVICE_NAME:
         description: 'DEVICE_NAME'
         required: true
-        default: 'PD2415'
+        default: 'pd2415'
       MAKEFILE_NAME:
         description: 'MAKEFILE_NAME'
         required: true
-        default: 'twrp_PD2415-trunk_staging'
+        default: 'twrp_pd2415-ap3a'
       BUILD_TARGET:
         description: 'BUILD_TARGET (currently builds recovery + vendor_boot together; kept for reference)'
         required: true
