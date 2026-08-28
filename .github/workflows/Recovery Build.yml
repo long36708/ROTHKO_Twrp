@@ -3,6 +3,14 @@ name: OrangeFox Build
 on:
   workflow_dispatch:
     inputs:
+      SYNC_METHOD:
+        description: '源码同步方式 (详见 manifests/README.md)'
+        required: true
+        default: 'sync-script'
+        type: choice
+        options:
+          - sync-script
+          - pinned
       SYNC_URL:
         description: '橙狐同步脚本仓库 (OrangeFox sync)'
         required: true
@@ -88,6 +96,7 @@ jobs:
       - name: Display Run Parameters
         run: |
           echo "::group::User Environment Variables"
+          echo "Sync Method: ${{ github.event.inputs.SYNC_METHOD }}"
           echo "Sync URL: ${{ github.event.inputs.SYNC_URL }}"
           echo "Sync Revision: ${{ github.event.inputs.SYNC_REVISION }}"
           echo "OrangeFox branch: fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
@@ -203,20 +212,37 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 优先使用 pinned manifest (可复现); 没有则退回官方同步脚本。
-          # 查找顺序: 本构建仓库 manifests/ -> 设备树 manifests/。
+          # 两种方式:
+          #   sync-script (默认) - 用 orangefox_sync.sh。脚本与它自带的 patches/
+          #   天然配套, 会依次打上 manifest(build/make)、vold、update_engine、
+          #   vendor/twrp 全部补丁, 自洽且可靠, 但结果不可复现。
+          #   pinned            - 用 pinned manifest 锁定 662 个项目的 revision。
+          #   注意: `repo manifest -r` 只记录 revision, 不记录工作区补丁!
+          #   所以 pinned 路径必须自行补打全部补丁 (见 Apply OrangeFox setup patches),
+          #   否则 build/make 缺少 BUILD_BROKEN_PLUGIN_VALIDATION, soong 引导会失败:
+          #     "New plugins are not supported; however ["soong-libaosprecovery_defaults"
+          #      "soong-libguitwrp_defaults" "soong-libminuitwrp_defaults"
+          #      "soong-vold_defaults"] were found."
+          use_pinned=0
           pinned_manifest=""
-          for candidate in \
-            "$GITHUB_WORKSPACE/builder/manifests/orangefox-fox_${{ github.event.inputs.MANIFEST_BRANCH }}-pinned.xml" \
-            "$GITHUB_WORKSPACE/device-tree/manifests/orangefox-fox_${{ github.event.inputs.MANIFEST_BRANCH }}-pinned.xml"
-          do
-            if [[ -f "$candidate" ]]; then
-              pinned_manifest="$candidate"
-              break
+          if [[ "${{ github.event.inputs.SYNC_METHOD }}" = "pinned" ]]; then
+            # 查找顺序: 本构建仓库 manifests/ -> 设备树 manifests/。
+            for candidate in \
+              "$GITHUB_WORKSPACE/builder/manifests/orangefox-fox_${{ github.event.inputs.MANIFEST_BRANCH }}-pinned.xml" \
+              "$GITHUB_WORKSPACE/device-tree/manifests/orangefox-fox_${{ github.event.inputs.MANIFEST_BRANCH }}-pinned.xml"
+            do
+              if [[ -f "$candidate" ]]; then
+                pinned_manifest="$candidate"
+                use_pinned=1
+                break
+              fi
+            done
+            if [[ "$use_pinned" -eq 0 ]]; then
+              echo "::warning::SYNC_METHOD=pinned 但未找到 pinned manifest, 回退到 orangefox_sync.sh"
             fi
-          done
+          fi
 
-          if [[ -n "$pinned_manifest" ]]; then
+          if [[ "$use_pinned" -eq 1 ]]; then
             echo "pinned=1" >> "$GITHUB_OUTPUT"
             echo "Using pinned manifest: $pinned_manifest"
             # 附带校验和时先校验清单内容未被篡改。
@@ -245,8 +271,7 @@ jobs:
             repo init --depth=1 -u "file://${manifest_repo}" -b main -m default.xml
           else
             echo "pinned=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::未找到 pinned manifest, 使用 orangefox_sync.sh (结果不可复现)。"
-            echo "::warning::在 ROTHKO_Twrp/manifests/ 或设备树 manifests/ 放入 orangefox-fox_${{ github.event.inputs.MANIFEST_BRANCH }}-pinned.xml 可启用可复现构建; 生成方法见 ROTHKO_Twrp/manifests/README.md"
+            echo "Using orangefox_sync.sh (self-consistent, but not reproducible)."
             sync_dir="$GITHUB_WORKSPACE/ofox-sync"
             mkdir -p "$ORANGEFOX_TOP"
             git clone --filter=blob:none ${{ github.event.inputs.SYNC_URL }} "$sync_dir"
@@ -321,32 +346,66 @@ jobs:
           set -euo pipefail
 
           # pinned manifest 只锁定源码 revision, 补丁仍需手工应用。
+          # 这里必须补齐 orangefox_sync.sh 会做的全部补丁, 少任何一个都会在
+          # 后续步骤以看似无关的错误暴露出来。
+          BRANCH="${{ github.event.inputs.MANIFEST_BRANCH }}"
           sync_dir="$GITHUB_WORKSPACE/ofox-sync"
           git clone --filter=blob:none \
             ${{ github.event.inputs.SYNC_URL }} "$sync_dir"
           git -C "$sync_dir" checkout --detach ${{ github.event.inputs.SYNC_REVISION }}
           test "$(git -C "$sync_dir" rev-parse HEAD)" = "${{ github.event.inputs.SYNC_REVISION }}"
 
-          vold_patch="$sync_dir/patches/patch-vold-fox_${{ github.event.inputs.MANIFEST_BRANCH }}.diff"
-          # 与 SYNC_REVISION 配套的补丁校验和。换了 sync revision 就要同步改这里,
-          # 否则补丁内容漂移会一路静默到编译失败。
-          if [[ "${{ github.event.inputs.SYNC_REVISION }}" = "11e4406b2bd1de939a26b6bfbad7e371cc3b1fa7" ]]; then
-            test "$(sha256sum "$vold_patch" | awk '{print $1}')" = \
-              "29b4b0b387c3185a3dcc69f141a3c84969510547d13ed2de71eefa8423c57778"
+          # 幂等应用: 已打过则跳过, 否则先 --check 再 apply, 失败报明确错误。
+          apply_patch() {
+            local target="$1" patch="$2"
+            if [[ ! -f "$patch" ]]; then
+              echo "::error::缺少补丁 $patch"
+              return 1
+            fi
+            if git -C "$target" apply --reverse --check "$patch" 2>/dev/null; then
+              echo "already applied: $patch -> $target"
+              return 0
+            fi
+            if ! git -C "$target" apply --check "$patch" 2>/dev/null; then
+              echo "::error::补丁无法应用 $patch -> $target"
+              echo "::error::通常是 pinned revision 与该补丁所基于的源码不一致, 改用 SYNC_METHOD=sync-script 或重新生成 pinned manifest"
+              return 1
+            fi
+            git -C "$target" apply "$patch"
+            echo "applied: $patch -> $target"
+          }
+
+          # 1) build/make —— 最关键。它定义 BUILD_BROKEN_PLUGIN_VALIDATION,
+          #    缺了它 soong 引导会直接失败。注意源文件名为 patch-manifest-*.diff,
+          #    但作用目录是 build/make (脚本里 PATCH_FILE -> $MANIFEST_DIR/build)。
+          apply_patch "$ORANGEFOX_TOP/build/make" \
+            "$sync_dir/patches/patch-manifest-fox_${BRANCH}.diff"
+
+          # 2) system/vold —— 橙狐的 vold 适配
+          apply_patch "$ORANGEFOX_TOP/system/vold" \
+            "$sync_dir/patches/patch-vold-fox_${BRANCH}.diff"
+
+          # 3) system/update_engine —— 块级 OTA 适配
+          apply_patch "$ORANGEFOX_TOP/system/update_engine" \
+            "$sync_dir/patches/patch-update-engine-fox_${BRANCH}.diff"
+
+          # 4) vendor/twrp —— 同步脚本用 sed 注入橙狐 makefile, 而非补丁文件。
+          #    注意该文件名没有 patches/ 前缀。
+          vendor_twrp="$sync_dir/patch-vendor-twrp-fox_${BRANCH}.diff"
+          if [[ -f "$vendor_twrp" ]]; then
+            apply_patch "$ORANGEFOX_TOP/vendor/twrp" "$vendor_twrp"
           else
-            echo "::warning::SYNC_REVISION 非预设值, 跳过 vold 补丁校验和检查"
+            echo "::warning::未找到 $vendor_twrp, 跳过 vendor/twrp 补丁"
           fi
 
-          if [[ ! -f "$vold_patch" ]]; then
-            echo "::warning::未找到 $vold_patch, 跳过 system/vold 补丁"
-            exit 0
-          fi
-          if git -C "$ORANGEFOX_TOP/system/vold" apply --reverse --check "$vold_patch" 2>/dev/null; then
-            echo "OrangeFox system/vold patch is already applied"
-          else
-            git -C "$ORANGEFOX_TOP/system/vold" apply --check "$vold_patch"
-            git -C "$ORANGEFOX_TOP/system/vold" apply "$vold_patch"
-          fi
+          # 校验: 关键标记必须存在, 否则后续 soong 一定失败。
+          for marker in BUILD_BROKEN_PLUGIN_VALIDATION Fox_Before_Recovery_Image; do
+            if ! grep -qr "$marker" "$ORANGEFOX_TOP/build/make"; then
+              echo "::error::build/make 缺少橙狐标记 $marker, 补丁未生效"
+              exit 1
+            fi
+            echo "verified marker in build/make: $marker"
+          done
 
       - name: Install device tree
         shell: bash
