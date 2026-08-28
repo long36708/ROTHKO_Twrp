@@ -4,13 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       SYNC_URL:
-        description: 'SYNC_URL (橙狐官方同步脚本仓库; SSH 请用 git@gitlab.com:OrangeFox/sync.git)'
+        description: '橙狐同步脚本仓库 (OrangeFox sync)'
         required: true
         default: 'https://gitlab.com/OrangeFox/sync.git'
+      SYNC_REVISION:
+        description: 'OrangeFox/sync 仓库 revision (补丁来源; 必须与 pinned manifest 配套, 详见 manifests/PROVENANCE.md)'
+        required: true
+        default: '11e4406b2bd1de939a26b6bfbad7e371cc3b1fa7'
       MANIFEST_BRANCH:
-        description: 'MANIFEST_BRANCH (橙狐分支: 14.1 / 12.1)'
+        description: '橙狐源码分支'
         required: true
         default: '14.1'
+        type: choice
+        options:
+          - '14.1'
+          - '12.1'
       DEVICE_TREE_URL:
         description: 'DEVICE_TREE_URL'
         required: true
@@ -45,168 +53,538 @@ on:
         description: 'JAVA_VERSION (fox_14.1 用 17, fox_12.1 用 11)'
         required: true
         default: '17'
+      PUBLISH:
+        description: 'BUILD 成功后创建 prerelease'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orangefox-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ORANGEFOX_TOP: ${{ github.workspace }}/OrangeFox
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: '3G'
+  CCACHE_CACHE_VERSION: '1'
+  MIN_SWAP_GIB: '12'
+  # fox_14.1 源码 + out 峰值约需 83 GiB, 另留 3 GiB 编译缓存。
+  REQUIRED_DISK_GIB: '98'
+  # 删除 .repo 后仍要为 Soong 写入 out/ 保底。
+  REQUIRED_COMPILE_DISK_GIB: '38'
+  REQUIRED_MEMORY_GIB: '14'
 
 jobs:
   build:
     if: github.event.repository.owner.id == github.event.sender.id
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Display Run Parameters
+        run: |
+          echo "::group::User Environment Variables"
+          echo "Sync URL: ${{ github.event.inputs.SYNC_URL }}"
+          echo "Sync Revision: ${{ github.event.inputs.SYNC_REVISION }}"
+          echo "OrangeFox branch: fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
+          echo "Device Tree URL: ${{ github.event.inputs.DEVICE_TREE_URL }}"
+          echo "Device Tree Branch: ${{ github.event.inputs.DEVICE_TREE_BRANCH }}"
+          echo "Device Path: ${{ github.event.inputs.DEVICE_PATH }}"
+          echo "Device Name: ${{ github.event.inputs.DEVICE_NAME }}"
+          echo "Makefile Name: ${{ github.event.inputs.MAKEFILE_NAME }}-eng"
+          echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}"
+          echo "Java Version: ${{ github.event.inputs.JAVA_VERSION }}"
+          echo "::endgroup::"
+
+      - name: Check Out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: builder
+
+      # 清理镜像自带的无关负载, 比单纯 apt clean 释放更多空间。
+      - name: Free disk space
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Install host packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler flex g++-multilib \
+            gcc-multilib git git-lfs gnupg gperf imagemagick \
+            lib32ncurses-dev lib32readline-dev lib32z1-dev libelf-dev \
+            liblz4-tool libncurses-dev libsdl1.2-dev libssl-dev libxml2 \
+            libxml2-utils lz4 openjdk-${{ github.event.inputs.JAVA_VERSION }}-jdk-headless \
+            pngcrush python-is-python3 python3 ripgrep rsync schedtool squashfs-tools \
+            unzip xsltproc zip zlib1g-dev
+          sudo apt-get clean
+          java_home="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
+          test -x "${java_home}/bin/java"
+          echo "JAVA_HOME=${java_home}" >> "$GITHUB_ENV"
+
+      - name: Fetch device tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 \
+            ${{ github.event.inputs.DEVICE_TREE_URL }} \
+            -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} \
+            "$GITHUB_WORKSPACE/device-tree"
+          # LFS 指针文件会让后续的 blob 校验通过但内容为空, 必须落地实体文件。
+          if git -C "$GITHUB_WORKSPACE/device-tree" config --get-regexp '^filter\.lfs' >/dev/null 2>&1; then
+            git -C "$GITHUB_WORKSPACE/device-tree" lfs pull
+          fi
+
+      - name: Setup build swap
+        shell: bash
+        run: |
+          set -euo pipefail
+          MIN_SWAP_GIB="$MIN_SWAP_GIB" \
+            bash "$GITHUB_WORKSPACE/builder/.github/scripts/setup-swap.sh"
+
+      - name: Check runner capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          available_kib="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 { print $4 }')"
+          required_kib=$((REQUIRED_DISK_GIB * 1024 * 1024))
+          if [[ -z "${available_kib}" || "${available_kib}" -lt "${required_kib}" ]]; then
+            echo "::error::需要至少 ${REQUIRED_DISK_GIB} GiB 可用空间 (清理后实测 $((available_kib / 1024 / 1024)) GiB)。请改用 larger runner。"
+            exit 1
+          fi
+          memory_kib="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+          required_memory_kib=$((REQUIRED_MEMORY_GIB * 1024 * 1024))
+          if [[ -z "${memory_kib}" || "${memory_kib}" -lt "${required_memory_kib}" ]]; then
+            echo "::error::需要 ${REQUIRED_MEMORY_GIB} GiB 级内存 runner (实测 $((memory_kib / 1024 / 1024)) GiB)。"
+            exit 1
+          fi
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+
+      - name: Restore compiler cache
+        id: ccache_restore
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: orangefox-ccache-${{ env.CCACHE_CACHE_VERSION }}-${{ runner.os }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.event.inputs.DEVICE_NAME }}
+          restore-keys: |
+            orangefox-ccache-${{ env.CCACHE_CACHE_VERSION }}-${{ runner.os }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.event.inputs.DEVICE_NAME }}-
+
+      - name: Configure compiler cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v ccache
+          install -d "$CCACHE_DIR"
+          ccache -M "$CCACHE_MAXSIZE"
+          ccache -z
+          ccache -p
+
+      - name: Install repo tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d "$HOME/bin"
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            --output "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Sync OrangeFox sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 优先使用 pinned manifest (可复现); 没有则退回官方同步脚本。
+          # 查找顺序: 本构建仓库 manifests/ -> 设备树 manifests/。
+          pinned_manifest=""
+          for candidate in \
+            "$GITHUB_WORKSPACE/builder/manifests/orangefox-fox_${{ github.event.inputs.MANIFEST_BRANCH }}-pinned.xml" \
+            "$GITHUB_WORKSPACE/device-tree/manifests/orangefox-fox_${{ github.event.inputs.MANIFEST_BRANCH }}-pinned.xml"
+          do
+            if [[ -f "$candidate" ]]; then
+              pinned_manifest="$candidate"
+              break
+            fi
+          done
+
+          if [[ -n "$pinned_manifest" ]]; then
+            echo "pinned=1" >> "$GITHUB_OUTPUT"
+            echo "Using pinned manifest: $pinned_manifest"
+            # 附带校验和时先校验清单内容未被篡改。
+            if [[ -f "${pinned_manifest}.sha256" ]]; then
+              (
+                cd "$(dirname "$pinned_manifest")"
+                sha256sum --check --strict "$(basename "$pinned_manifest").sha256"
+              )
+            fi
+            manifest_repo="$GITHUB_WORKSPACE/pinned-manifest"
+            export GIT_CONFIG_GLOBAL="$GITHUB_WORKSPACE/ci-gitconfig"
+            mkdir -p "$manifest_repo"
+            cp "$pinned_manifest" "$manifest_repo/default.xml"
+            git -C "$manifest_repo" init --initial-branch=main --quiet
+            git -C "$manifest_repo" config user.name "OrangeFox CI"
+            git -C "$manifest_repo" config user.email "orangefox-ci@localhost"
+            git -C "$manifest_repo" add default.xml
+            git -C "$manifest_repo" commit --quiet -m "Pinned OrangeFox ${{ github.event.inputs.MANIFEST_BRANCH }} manifest"
+            git config --global protocol.file.allow always
+            # GitLab 偶发重置长连接; 容忍慢速 pack 传输。
+            git config --global http.lowSpeedLimit 1
+            git config --global http.lowSpeedTime 600
+
+            mkdir -p "$ORANGEFOX_TOP"
+            cd "$ORANGEFOX_TOP"
+            repo init --depth=1 -u "file://${manifest_repo}" -b main -m default.xml
+          else
+            echo "pinned=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::未找到 pinned manifest, 使用 orangefox_sync.sh (结果不可复现)。"
+            echo "::warning::在 ROTHKO_Twrp/manifests/ 或设备树 manifests/ 放入 orangefox-fox_${{ github.event.inputs.MANIFEST_BRANCH }}-pinned.xml 可启用可复现构建; 生成方法见 ROTHKO_Twrp/manifests/README.md"
+            sync_dir="$GITHUB_WORKSPACE/ofox-sync"
+            mkdir -p "$ORANGEFOX_TOP"
+            git clone --filter=blob:none ${{ github.event.inputs.SYNC_URL }} "$sync_dir"
+            if [[ -n "${{ github.event.inputs.SYNC_REVISION }}" ]]; then
+              git -C "$sync_dir" checkout --detach ${{ github.event.inputs.SYNC_REVISION }}
+              test "$(git -C "$sync_dir" rev-parse HEAD)" = "${{ github.event.inputs.SYNC_REVISION }}"
+            fi
+            # orangefox_sync.sh 会拉取 TWRP minimal manifest, 打上橙狐补丁,
+            # 再克隆 bootable/recovery 与 vendor/recovery 的 fox_<branch> 分支。
+            #
+            # 关键: 脚本用 BASE_DIR="$PWD" 定位 patches/patch-manifest-*.diff,
+            # 因此必须 cd 进同步仓库再执行, 否则会报
+            # "I cannot find the patch file: <cwd>/patches/... - quitting!"。
+            cd "$sync_dir"
+            test -f "patches/patch-manifest-fox_${{ github.event.inputs.MANIFEST_BRANCH }}.diff"
+
+            # 脚本内部会静默跑数小时的 repo sync; 没有输出会被 CI 判为超时。
+            (
+              while sleep 60; do
+                date -u '+%Y-%m-%dT%H:%M:%SZ sync heartbeat'
+                df -h "$GITHUB_WORKSPACE"
+                free -h
+              done
+            ) &
+            heartbeat_pid=$!
+            trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
+
+            bash ./orangefox_sync.sh \
+              --branch ${{ github.event.inputs.MANIFEST_BRANCH }} \
+              --path "$ORANGEFOX_TOP"
+
+            kill "$heartbeat_pid" 2>/dev/null || true
+            trap - EXIT
+            exit 0
+          fi
+
+          (
+            while sleep 60; do
+              date -u '+%Y-%m-%dT%H:%M:%SZ sync heartbeat'
+              df -h "$GITHUB_WORKSPACE"
+              free -h
+            done
+          ) &
+          heartbeat_pid=$!
+          trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
+
+          sync_succeeded=0
+          for sync_attempt in 1 2 3; do
+            if repo sync -c -j4 --retry-fetches=3 --no-clone-bundle --no-tags --optimized-fetch; then
+              sync_succeeded=1
+              break
+            fi
+            if [[ "$sync_attempt" -lt 3 ]]; then
+              delay_seconds=$((sync_attempt * 20))
+              echo "::warning::同步第 ${sync_attempt} 次失败, ${delay_seconds}s 后重试。"
+              sleep "$delay_seconds"
+            fi
+          done
+          if [[ "$sync_succeeded" -ne 1 ]]; then
+            echo "::error::源码同步三次均失败。" >&2
+            exit 1
+          fi
+
+          kill "$heartbeat_pid" 2>/dev/null || true
+          trap - EXIT
+        id: sync
+
+      - name: Apply OrangeFox setup patches
+        if: steps.sync.outputs.pinned == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # pinned manifest 只锁定源码 revision, 补丁仍需手工应用。
+          sync_dir="$GITHUB_WORKSPACE/ofox-sync"
+          git clone --filter=blob:none \
+            ${{ github.event.inputs.SYNC_URL }} "$sync_dir"
+          git -C "$sync_dir" checkout --detach ${{ github.event.inputs.SYNC_REVISION }}
+          test "$(git -C "$sync_dir" rev-parse HEAD)" = "${{ github.event.inputs.SYNC_REVISION }}"
+
+          vold_patch="$sync_dir/patches/patch-vold-fox_${{ github.event.inputs.MANIFEST_BRANCH }}.diff"
+          # 与 SYNC_REVISION 配套的补丁校验和。换了 sync revision 就要同步改这里,
+          # 否则补丁内容漂移会一路静默到编译失败。
+          if [[ "${{ github.event.inputs.SYNC_REVISION }}" = "11e4406b2bd1de939a26b6bfbad7e371cc3b1fa7" ]]; then
+            test "$(sha256sum "$vold_patch" | awk '{print $1}')" = \
+              "29b4b0b387c3185a3dcc69f141a3c84969510547d13ed2de71eefa8423c57778"
+          else
+            echo "::warning::SYNC_REVISION 非预设值, 跳过 vold 补丁校验和检查"
+          fi
+
+          if [[ ! -f "$vold_patch" ]]; then
+            echo "::warning::未找到 $vold_patch, 跳过 system/vold 补丁"
+            exit 0
+          fi
+          if git -C "$ORANGEFOX_TOP/system/vold" apply --reverse --check "$vold_patch" 2>/dev/null; then
+            echo "OrangeFox system/vold patch is already applied"
+          else
+            git -C "$ORANGEFOX_TOP/system/vold" apply --check "$vold_patch"
+            git -C "$ORANGEFOX_TOP/system/vold" apply "$vold_patch"
+          fi
+
+      - name: Install device tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ORANGEFOX_TOP/${{ github.event.inputs.DEVICE_PATH }}"
+          rsync -a --delete \
+            --exclude .git \
+            "$GITHUB_WORKSPACE/device-tree/" \
+            "$ORANGEFOX_TOP/${{ github.event.inputs.DEVICE_PATH }}/"
+
+      - name: Clone common tree
+        if: ${{ github.event.inputs.COMMON_TREE_URL != '' && github.event.inputs.COMMON_PATH != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 \
+            ${{ github.event.inputs.COMMON_TREE_URL }} \
+            -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} \
+            "$ORANGEFOX_TOP/${{ github.event.inputs.COMMON_PATH }}"
+
+      - name: Apply device tree patches
+        shell: bash
+        working-directory: ${{ env.ORANGEFOX_TOP }}
+        run: |
+          set -euo pipefail
+          # 设备树的 apply-patches.sh 必须在源码根目录执行; 无补丁时为空操作。
+          script="${{ github.event.inputs.DEVICE_PATH }}/apply-patches.sh"
+          if [[ -f "$script" ]]; then
+            chmod +x "$script"
+            sh "$script"
+          fi
+
+      - name: Sync Device Dependencies
+        shell: bash
+        working-directory: ${{ env.ORANGEFOX_TOP }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # 必须在删除 .repo 之前完成; omni_*.dependencies / twrp_*.dependencies 二者取其一。
+          for dep in omni twrp; do
+            f="${{ github.event.inputs.DEVICE_PATH }}/$dep.dependencies"
+            if [[ -f "$f" ]]; then
+              bash "$GITHUB_WORKSPACE/builder/scripts/convert.sh" "$f"
+              break
+            fi
+          done
+          repo sync -j"$(nproc)"
+
+      - name: Drop sync metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$ORANGEFOX_TOP/.repo" \
+            "$GITHUB_WORKSPACE/ofox-sync" \
+            "$GITHUB_WORKSPACE/pinned-manifest" \
+            "$GITHUB_WORKSPACE/ci-gitconfig"
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+
+      - name: Check compilation capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          available_kib="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 { print $4 }')"
+          required_kib=$((REQUIRED_COMPILE_DISK_GIB * 1024 * 1024))
+          if [[ -z "${available_kib}" || "${available_kib}" -lt "${required_kib}" ]]; then
+            echo "::error::删除 .repo 后需要至少 ${REQUIRED_COMPILE_DISK_GIB} GiB (实测 $((available_kib / 1024 / 1024)) GiB)。"
+            exit 1
+          fi
+          du -sh "$ORANGEFOX_TOP"
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Building OrangeFox
+        shell: bash
+        working-directory: ${{ env.ORANGEFOX_TOP }}
+        env:
+          ALLOW_MISSING_DEPENDENCIES: 'true'
+          FOX_BUILD_DEVICE: ${{ github.event.inputs.DEVICE_NAME }}
+          FOX_AB_DEVICE: '1'
+          FOX_VIRTUAL_AB_DEVICE: '1'
+          OF_FORCE_PREBUILT_KERNEL: '1'
+          OF_LOW_MEMORY_BUILD: '1'
+          GOMEMLIMIT: '3GiB'
+          GOGC: '20'
+          _JAVA_OPTIONS: '-Xmx3g'
+          USE_CCACHE: '1'
+          CCACHE_EXEC: /usr/bin/ccache
+          CCACHE_COMPILERCHECK: content
+          CCACHE_COMPRESS: 'true'
+        run: |
+          set -euo pipefail
+          build_jobs="$(nproc)"
+          export OF_BUILD_JOBS="$build_jobs"
+          export NINJA_ARGS="-j${build_jobs} -l${build_jobs}"
+          export SOONG_UI_NINJA_ARGS="$NINJA_ARGS"
+          printf 'Using %s Ninja jobs\n' "$build_jobs"
+
+          (
+            while sleep 60; do
+              date -u '+%Y-%m-%dT%H:%M:%SZ build heartbeat'
+              df -h "$GITHUB_WORKSPACE"
+              free -h
+            done
+          ) &
+          heartbeat_pid=$!
+          trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
+
+          set +u
+          source build/envsetup.sh
+          lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+          make ${{ github.event.inputs.BUILD_TARGET }} -j"$build_jobs" 2>&1 | \
+            tee "$GITHUB_WORKSPACE/orangefox-build.log"
+
+          kill "$heartbeat_pid" 2>/dev/null || true
+          trap - EXIT
+
+      - name: Report compiler cache
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ccache -s
+          du -sh "$CCACHE_DIR"
+
+      - name: Collect release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          product="$ORANGEFOX_TOP/out/target/product/${{ github.event.inputs.DEVICE_NAME }}"
+          test -d "$product"
+          rm -rf "$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          shopt -s nullglob
+          images=("$product"/OrangeFox-*.img "$product"/OrangeFox-*.zip "$product"/vendor_boot.img "$product"/recovery.img)
+          shopt -u nullglob
+          if [[ "${#images[@]}" -eq 0 ]]; then
+            echo "::error::$product 下没有找到任何产物镜像"
+            ls -all "$product"
+            exit 1
+          fi
+          for image in "${images[@]}"; do
+            cp -fp "$image" "$GITHUB_WORKSPACE/artifacts/"
+          done
+          (
+            cd "$GITHUB_WORKSPACE/artifacts"
+            sha256sum * > sha256sums.txt
+          )
+          cat > "$GITHUB_WORKSPACE/artifacts/build-info.md" <<EOF
+          Automated OrangeFox build for ${{ github.event.inputs.DEVICE_NAME }}.
+
+          - OrangeFox branch: fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+          - Device tree: ${{ github.event.inputs.DEVICE_TREE_URL }} (${{ github.event.inputs.DEVICE_TREE_BRANCH }})
+          - Lunch: ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+          - Target: ${{ github.event.inputs.BUILD_TARGET }}
+          - Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          ls -all "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Save compiler cache
+        if: ${{ success() && steps.ccache_restore.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: orangefox-ccache-${{ env.CCACHE_CACHE_VERSION }}-${{ runner.os }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.event.inputs.DEVICE_NAME }}
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangefox-${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangefox-${{ github.event.inputs.DEVICE_NAME }}-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: orangefox-build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Clean build worktree
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$ORANGEFOX_TOP" \
+            "$GITHUB_WORKSPACE/ofox-sync" \
+            "$GITHUB_WORKSPACE/pinned-manifest" \
+            "$GITHUB_WORKSPACE/artifacts" \
+            "$GITHUB_WORKSPACE/ci-gitconfig"
+
+  release:
+    if: ${{ needs.build.result == 'success' && github.event.inputs.PUBLISH == 'true' }}
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: write
+
     steps:
-    - name: Display Run Parameters
-      run: |
-        echo "::group::User Environment Variables"
-        echo "Sync URL: ${{ github.event.inputs.SYNC_URL }}"
-        echo "Manifest Branch: fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
-        echo "Device Tree URL: ${{ github.event.inputs.DEVICE_TREE_URL }}"
-        echo "Device Tree Branch: ${{ github.event.inputs.DEVICE_TREE_BRANCH }}"
-        echo "Device Path: ${{ github.event.inputs.DEVICE_PATH }}"
-        echo "Device Name: ${{ github.event.inputs.DEVICE_NAME }}"
-        echo "Makefile Name: ${{ github.event.inputs.MAKEFILE_NAME }}-eng"
-        echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}"
-        echo "Java Version: ${{ github.event.inputs.JAVA_VERSION }}"
-        echo "::endgroup::"
- 
-    # You might want to Checkout your repo first, but not mandatory
-    - name: Check Out
-      uses: actions/checkout@v3
-    # Cleanup The Actions Workspace Using Custom Composite Run Actions
-    - name: Cleanup
-      uses: rokibhasansagar/slimhub_actions@main
-      # That's it! Now use your normal steps
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: orangefox-${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-artifacts
 
-    - name: Prepare the environment
-      run: |
-        sudo add-apt-repository -y universe
-        sudo apt update
-        sudo apt -y upgrade
-        sudo apt -y install gperf gcc-multilib gcc-10-multilib g++-multilib g++-10-multilib libc6-dev lib32ncurses-dev x11proto-core-dev libx11-dev tree lib32z-dev libgl1-mesa-dev libxml2-utils xsltproc bc ccache lib32readline-dev lib32z1-dev liblz4-tool libncurses-dev libsdl1.2-dev libwxgtk3.2-dev libxml2 lzop pngcrush schedtool squashfs-tools imagemagick libbz2-dev lzma ncftp qemu-user-static libstdc++-10-dev python3
+      - name: Verify images
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          test -f sha256sums.txt
+          sha256sum --check --strict sha256sums.txt
 
-    - name: Install OpenJDK
-      uses: actions/setup-java@v3
-      with:
-        distribution: 'zulu'
-        java-version: ${{ github.event.inputs.JAVA_VERSION }}
+      - name: Create prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          release_tag="${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          cat > "$GITHUB_WORKSPACE/release-notes.md" <<EOF
+          Automated OrangeFox build for ${{ github.event.inputs.DEVICE_NAME }}.
 
-    - name: Setup SSH Keys
-      if: ${{ startsWith(github.event.inputs.SYNC_URL, 'git@') ||
-          startsWith(github.event.inputs.DEVICE_TREE_URL, 'git@github.com') ||
-          startsWith(github.event.inputs.COMMON_TREE_URL, 'git@github.com') }}
-      uses: webfactory/ssh-agent@v0.5.4
-      with:
-          ssh-private-key: |
-            ${{ secrets.SSH_PRIVATE_KEY }}
-
-
-    - name: Install repo
-      run: |
-        mkdir ~/bin
-        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-        chmod a+x ~/bin/repo
-        sudo ln -sf ~/bin/repo /usr/bin/repo
-      
-    - name: Maximize build space
-      run: |
-        # fox_14.1 needs ~85GB; trim the preinstalled toolchains first.
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell || true
-        df -h || true
-
-    - name: Sync OrangeFox sources
-      run: |
-        mkdir -p workspace
-        cd workspace
-        git config --global user.name "Nico170420"
-        git config --global user.email "b170420nc@gmail.com"
-        # Official OrangeFox sync: pulls the matching TWRP minimal manifest, applies
-        # the OrangeFox manifest/vold/update_engine/vendor-twrp patches, then clones
-        # bootable/recovery (fox_<branch>) and vendor/recovery (fox_<branch>).
-        # Do NOT hand-clone vendor/orangefox on top of this.
-        git clone --depth=1 ${{ github.event.inputs.SYNC_URL }} ofox-sync
-        FOX_DIR="$GITHUB_WORKSPACE/workspace/fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
-        bash ofox-sync/orangefox_sync.sh --branch ${{ github.event.inputs.MANIFEST_BRANCH }} --path "$FOX_DIR"
-        echo "workspace-folder=$FOX_DIR" >> $GITHUB_OUTPUT
-      id: pwd
-      
-    - name: Clone device tree
-      run: |
-        git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-
-    - name: Clone common tree
-      if: |
-        github.event.inputs.COMMON_TREE_URL != null
-        && github.event.inputs.COMMON_PATH != null
-      run: |
-        git clone ${{ github.event.inputs.COMMON_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.COMMON_PATH }}
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-
-    - name: Apply device tree patches
-      run: |
-        # apply-patches.sh must run from the OrangeFox source root; it is a
-        # no-op while patches/recovery/ holds no *.patch files.
-        if [ -f ${{ github.event.inputs.DEVICE_PATH }}/apply-patches.sh ]; then
-          chmod +x ${{ github.event.inputs.DEVICE_PATH }}/apply-patches.sh
-          sh ${{ github.event.inputs.DEVICE_PATH }}/apply-patches.sh
-        fi
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-
-    - name: Sync Device Dependencies
-      run: |
-        # OrangeFox device trees ship omni_<codename>.dependencies (older) or
-        # twrp_<codename>.dependencies; convert whichever is present.
-        for dep in omni twrp; do
-          f="${{ github.event.inputs.DEVICE_PATH }}/$dep.dependencies"
-          if [ -f "$f" ]; then
-            bash ${GITHUB_WORKSPACE}/scripts/convert.sh "$f"
-            break
-          fi
-        done
-        repo sync -j$(nproc --all)
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-      continue-on-error: true
-
-    - name: Set Swap Space
-      uses: pierotofy/set-swap-space@master
-      with:
-        swap-size-gb: 12
-
-    - name: Building OrangeFox
-      run: |
-        source build/envsetup.sh
-        export LC_ALL=C
-        export ALLOW_MISSING_DEPENDENCIES=true
-        # FOX_* / OF_* variables MUST be exported here (they are ignored in .mk files).
-        export FOX_BUILD_DEVICE=${{ github.event.inputs.DEVICE_NAME }}
-        export FOX_BUILD_TYPE=Unofficial
-        # pd2415 is a virtual A/B device carrying recovery in vendor_boot.
-        export FOX_AB_DEVICE=1
-        export FOX_VIRTUAL_AB_DEVICE=1
-        # The tree ships a prebuilt kernel -> avoid the "NO KERNEL CONFIG" error.
-        export OF_FORCE_PREBUILT_KERNEL=1
-        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
-        make clean
-        make ${{ github.event.inputs.BUILD_TARGET }} -j$(nproc --all)
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-
-    - name: Check the output directory before uploading
-      run: |
-        OUT_DIR=workspace/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}
-        ls -all "$OUT_DIR" || true
-        find "$OUT_DIR" -maxdepth 1 -name "OrangeFox-*" -o -maxdepth 1 -name "vendor_boot.img" || true
-
-    - name: Upload to Release
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          workspace/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox-*.img
-          workspace/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox-*.zip
-          workspace/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/vendor_boot.img
-          workspace/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/recovery.img
-        name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
-        tag_name: ${{ github.run_id }}
-        body: |
-          OrangeFox branch: fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-          Device: ${{ github.event.inputs.DEVICE_NAME }}
-          Target: ${{ github.event.inputs.BUILD_TARGET }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          - OrangeFox branch: fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+          - Device tree: ${{ github.event.inputs.DEVICE_TREE_URL }} (${{ github.event.inputs.DEVICE_TREE_BRANCH }})
+          - Lunch: ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+          - Target: ${{ github.event.inputs.BUILD_TARGET }}
+          - Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          gh release create "$release_tag" release-artifacts/* \
+            --repo "$GH_REPO" \
+            --title "OrangeFox ${{ github.event.inputs.DEVICE_NAME }} CI ${{ github.run_id }}" \
+            --notes-file "$GITHUB_WORKSPACE/release-notes.md" \
+            --prerelease
