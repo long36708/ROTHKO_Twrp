@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       SYNC_METHOD:
-        description: '源码同步方式 (详见 manifests/README.md)'
+        description: '源码同步方式 (pinned = 可复现, 默认; sync-script = 官方脚本兜底)'
         required: true
-        default: 'sync-script'
+        default: 'pinned'
         type: choice
         options:
-          - sync-script
           - pinned
+          - sync-script
       SYNC_URL:
         description: '橙狐同步脚本仓库 (OrangeFox sync)'
         required: true
@@ -213,16 +213,18 @@ jobs:
           set -euo pipefail
 
           # 两种方式:
-          #   sync-script (默认) - 用 orangefox_sync.sh。脚本与它自带的 patches/
-          #   天然配套, 会依次打上 manifest(build/make)、vold、update_engine、
-          #   vendor/twrp 全部补丁, 自洽且可靠, 但结果不可复现。
-          #   pinned            - 用 pinned manifest 锁定 662 个项目的 revision。
-          #   注意: `repo manifest -r` 只记录 revision, 不记录工作区补丁!
-          #   所以 pinned 路径必须自行补打全部补丁 (见 Apply OrangeFox setup patches),
-          #   否则 build/make 缺少 BUILD_BROKEN_PLUGIN_VALIDATION, soong 引导会失败:
-          #     "New plugins are not supported; however ["soong-libaosprecovery_defaults"
-          #      "soong-libguitwrp_defaults" "soong-libminuitwrp_defaults"
-          #      "soong-vold_defaults"] were found."
+          #   pinned (默认)   - 用 pinned manifest 锁定 662 个项目的 revision,
+          #   再应用本仓库 patches/ 下的配套补丁。可复现, 且补丁已针对该
+          #   revision 验证过 (源自 rodin 设备树), 推荐。
+          #   sync-script     - 用 orangefox_sync.sh。脚本与自带 patches/ 天然
+          #   配套, 一定自洽, 但结果不可复现。pinned 路径出问题时用它兜底。
+          #
+          # 注意: `repo manifest -r` 只记录 revision, 不记录工作区补丁!
+          # 所以 pinned 路径必须自行补打补丁 (见 Apply OrangeFox setup patches),
+          # 否则 build/make 缺少 BUILD_BROKEN_PLUGIN_VALIDATION, soong 引导会失败:
+          #   "New plugins are not supported; however ["soong-libaosprecovery_defaults"
+          #    "soong-libguitwrp_defaults" "soong-libminuitwrp_defaults"
+          #    "soong-vold_defaults"] were found."
           use_pinned=0
           pinned_manifest=""
           if [[ "${{ github.event.inputs.SYNC_METHOD }}" = "pinned" ]]; then
@@ -346,14 +348,24 @@ jobs:
           set -euo pipefail
 
           # pinned manifest 只锁定源码 revision, 补丁仍需手工应用。
-          # 这里必须补齐 orangefox_sync.sh 会做的全部补丁, 少任何一个都会在
-          # 后续步骤以看似无关的错误暴露出来。
-          BRANCH="${{ github.event.inputs.MANIFEST_BRANCH }}"
-          sync_dir="$GITHUB_WORKSPACE/ofox-sync"
-          git clone --filter=blob:none \
-            ${{ github.event.inputs.SYNC_URL }} "$sync_dir"
-          git -C "$sync_dir" checkout --detach ${{ github.event.inputs.SYNC_REVISION }}
-          test "$(git -C "$sync_dir" rev-parse HEAD)" = "${{ github.event.inputs.SYNC_REVISION }}"
+          #
+          # 补丁来自本仓库 patches/ (源自 rodin 设备树, 已核对无设备专属内容):
+          #   orangefox-build-make.patch  -> build/make
+          #     定义 BUILD_BROKEN_PLUGIN_VALIDATION。缺了它 soong 引导会失败:
+          #     "New plugins are not supported; however ["soong-libaosprecovery_defaults"
+          #      "soong-libguitwrp_defaults" "soong-libminuitwrp_defaults"
+          #      "soong-vold_defaults"] were found."
+          #   orangefox-vendor-twrp.patch -> vendor/twrp
+          #     引入 bootable/recovery/orangefox_soong.mk 并加 soong 配置变量。
+          #
+          # 为什么不直接用 OrangeFox/sync 仓库的 patch-manifest-fox_14.1.diff:
+          # 那份补丁基于 TeamWin minimal manifest 的 build 项目生成, 而本清单里
+          # build/make 是 nebrassy 的 android_build (506df226), base 不同打不上。
+          # patches/ 里的这两份是 rodin 针对该 revision 生成的, 配套可用。
+          #
+          # 刻意不复制 orangefox-recovery.patch: 它 20 个文件里有 4 处 rodin
+          # 硬件专属改动 (Type-C VBUS 供电、SIH6887 马达 I2C), 对 MTK 平台的
+          # pd2415 是错的。详见 patches/README.md。
 
           # 幂等应用: 已打过则跳过, 否则先 --check 再 apply, 失败报明确错误。
           apply_patch() {
@@ -375,28 +387,15 @@ jobs:
             echo "applied: $patch -> $target"
           }
 
-          # 1) build/make —— 最关键。它定义 BUILD_BROKEN_PLUGIN_VALIDATION,
-          #    缺了它 soong 引导会直接失败。注意源文件名为 patch-manifest-*.diff,
-          #    但作用目录是 build/make (脚本里 PATCH_FILE -> $MANIFEST_DIR/build)。
+          # 1) build/make —— 最关键。定义 BUILD_BROKEN_PLUGIN_VALIDATION,
+          #    缺了它 soong 引导会直接失败。
           apply_patch "$ORANGEFOX_TOP/build/make" \
-            "$sync_dir/patches/patch-manifest-fox_${BRANCH}.diff"
+            "$GITHUB_WORKSPACE/builder/patches/orangefox-build-make.patch"
 
-          # 2) system/vold —— 橙狐的 vold 适配
-          apply_patch "$ORANGEFOX_TOP/system/vold" \
-            "$sync_dir/patches/patch-vold-fox_${BRANCH}.diff"
-
-          # 3) system/update_engine —— 块级 OTA 适配
-          apply_patch "$ORANGEFOX_TOP/system/update_engine" \
-            "$sync_dir/patches/patch-update-engine-fox_${BRANCH}.diff"
-
-          # 4) vendor/twrp —— 同步脚本用 sed 注入橙狐 makefile, 而非补丁文件。
-          #    注意该文件名没有 patches/ 前缀。
-          vendor_twrp="$sync_dir/patch-vendor-twrp-fox_${BRANCH}.diff"
-          if [[ -f "$vendor_twrp" ]]; then
-            apply_patch "$ORANGEFOX_TOP/vendor/twrp" "$vendor_twrp"
-          else
-            echo "::warning::未找到 $vendor_twrp, 跳过 vendor/twrp 补丁"
-          fi
+          # 2) vendor/twrp —— 引入 orangefox_soong.mk, 并加
+          #    tw_drm_blank_keep_pipeline 等 soong 配置变量。
+          apply_patch "$ORANGEFOX_TOP/vendor/twrp" \
+            "$GITHUB_WORKSPACE/builder/patches/orangefox-vendor-twrp.patch"
 
           # 校验: 关键标记必须存在, 否则后续 soong 一定失败。
           for marker in BUILD_BROKEN_PLUGIN_VALIDATION Fox_Before_Recovery_Image; do
@@ -406,6 +405,10 @@ jobs:
             fi
             echo "verified marker in build/make: $marker"
           done
+          # 补丁改的是 config/BoardConfigSoong.mk (vendor/twrp 仓库内的路径)。
+          grep -q "orangefox_soong.mk" \
+            "$ORANGEFOX_TOP/vendor/twrp/config/BoardConfigSoong.mk" &&
+            echo "verified: vendor/twrp 已引入 orangefox_soong.mk"
 
       - name: Install device tree
         shell: bash

@@ -27,11 +27,12 @@ internal error: New plugins are not supported; however
 Please reach out to the build team or use BUILD_BROKEN_PLUGIN_VALIDATION
 ```
 
-原因是 `patch-manifest-fox_14.1.diff`（作用于 `build/make`）定义了
-`BUILD_BROKEN_PLUGIN_VALIDATION`，漏掉它就报上面这个看似无关的错。
+原因是 build/make 的补丁定义了 `BUILD_BROKEN_PLUGIN_VALIDATION`，漏掉它就
+报上面这个看似无关的错。
 
-工作流已补齐这 4 个补丁，并在打完后校验 `BUILD_BROKEN_PLUGIN_VALIDATION`、
-`Fox_Before_Recovery_Image` 两个标记是否存在，缺失直接报明确错误。
+工作流会用 [`../patches/`](../patches/README.md) 下的补丁补齐，并在打完后校验
+`BUILD_BROKEN_PLUGIN_VALIDATION`、`Fox_Before_Recovery_Image` 两个标记是否
+存在，缺失直接报明确错误。
 
 ## 生成
 
@@ -70,19 +71,25 @@ fox_14.1 的清单**已就位**，复制自 rodin 设备树（已核对：662 �
 
 fox_12.1 的清单**尚未生成**——当前设备只用 14.1，需要时按上面的步骤生成。
 
-### 已知风险：直接复用 rodin 清单可能打不上补丁
+### 为什么不能用 sync 仓库自带的补丁
 
 本清单里 `build/make` 是 **nebrassy 的 `android_build`**（`506df226`），
-而 `patch-manifest-fox_14.1.diff` 是针对 TeamWin minimal manifest 的 build
-项目生成的，两者 base 不同。rodin 能用，是因为它额外维护了针对自身 revision
-生成的 `orangefox-build-make.patch` 等 3 个补丁，我们没有。
+而 `OrangeFox/sync` 的 `patch-manifest-fox_14.1.diff` 是针对 **TeamWin minimal
+manifest** 的 build 项目生成的，两者 base 不同，打不上。
 
-结论：
+rodin 的解法是自己维护配套补丁。我们已从中复制了 2 个（无设备专属内容），
+放在 [`../patches/`](../patches/README.md)，因此 **`pinned` 现在可用且为默认值**。
 
-- **首次移植 / 求稳 → 用 `SYNC_METHOD=sync-script`（默认）**。脚本与自带
-  补丁天然配套，一定自洽；代价是不可复现。
-- **要可复现 → 先用 `generate-pinned-manifest.sh` 基于自己的同步结果重新生成
-  清单**，让 revision 与补丁配套，再切 `SYNC_METHOD=pinned`。
+### pinned 与 sync-script 的取舍
+
+| | `pinned`（默认） | `sync-script` |
+|---|---|---|
+| 可复现 | 是 | 否 |
+| 补丁配套 | 用本仓库 `patches/`，已针对该 revision 验证 | 脚本自带，天然自洽 |
+| 上游更新 | 需重新生成清单 + 更新补丁 | 自动跟随 |
+| 橙狐 recovery 增强 | 无（跳过 `orangefox-recovery.patch`） | 有 |
+
+**pinned 出问题时切 `sync-script` 兜底**，它会重新拉取源码并打官方补丁。
 
 ## 放置位置
 
