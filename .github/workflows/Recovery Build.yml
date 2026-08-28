@@ -1,16 +1,16 @@
-name: Recovery Build
+name: OrangeFox Build
 
 on:
   workflow_dispatch:
     inputs:
-      MANIFEST_URL:
-        description: 'MANIFEST_URL (if want to use SSH keys, use git@github.com:XXXXX)'
+      SYNC_URL:
+        description: 'SYNC_URL (橙狐官方同步脚本仓库; SSH 请用 git@gitlab.com:OrangeFox/sync.git)'
         required: true
-        default: 'https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp'
+        default: 'https://gitlab.com/OrangeFox/sync.git'
       MANIFEST_BRANCH:
-        description: 'MANIFEST_BRANCH'
+        description: 'MANIFEST_BRANCH (橙狐分支: 14.1 / 12.1)'
         required: true
-        default: 'twrp-14.1'
+        default: '14.1'
       DEVICE_TREE_URL:
         description: 'DEVICE_TREE_URL'
         required: true
@@ -34,13 +34,17 @@ on:
         required: true
         default: 'pd2415'
       MAKEFILE_NAME:
-        description: 'MAKEFILE_NAME'
+        description: 'MAKEFILE_NAME (不带 -eng 后缀)'
         required: true
-        default: 'twrp_pd2415-ap3a'
+        default: 'twrp_pd2415-ap2a'
       BUILD_TARGET:
-        description: 'BUILD_TARGET (currently builds recovery + vendor_boot together; kept for reference)'
+        description: 'BUILD_TARGET (make 目标, 空格分隔)'
         required: true
-        default: 'recovery vendorboot'
+        default: 'recoveryimage vendorbootimage'
+      JAVA_VERSION:
+        description: 'JAVA_VERSION (fox_14.1 用 17, fox_12.1 用 11)'
+        required: true
+        default: '17'
 
 jobs:
   build:
@@ -52,14 +56,15 @@ jobs:
     - name: Display Run Parameters
       run: |
         echo "::group::User Environment Variables"
-        echo "Manifest URL: ${{ github.event.inputs.MANIFEST_URL }}"
-        echo "Manifest Branch: ${{ github.event.inputs.MANIFEST_BRANCH }}"
+        echo "Sync URL: ${{ github.event.inputs.SYNC_URL }}"
+        echo "Manifest Branch: fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
         echo "Device Tree URL: ${{ github.event.inputs.DEVICE_TREE_URL }}"
         echo "Device Tree Branch: ${{ github.event.inputs.DEVICE_TREE_BRANCH }}"
         echo "Device Path: ${{ github.event.inputs.DEVICE_PATH }}"
         echo "Device Name: ${{ github.event.inputs.DEVICE_NAME }}"
-        echo "Makefile Name: ${{ github.event.inputs.MAKEFILE_NAME }}"
-        echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}.img"
+        echo "Makefile Name: ${{ github.event.inputs.MAKEFILE_NAME }}-eng"
+        echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}"
+        echo "Java Version: ${{ github.event.inputs.JAVA_VERSION }}"
         echo "::endgroup::"
  
     # You might want to Checkout your repo first, but not mandatory
@@ -81,10 +86,10 @@ jobs:
       uses: actions/setup-java@v3
       with:
         distribution: 'zulu'
-        java-version: '8'
+        java-version: ${{ github.event.inputs.JAVA_VERSION }}
 
     - name: Setup SSH Keys
-      if: ${{ startsWith(github.event.inputs.MANIFEST_URL, 'git@github.com') || 
+      if: ${{ startsWith(github.event.inputs.SYNC_URL, 'git@') ||
           startsWith(github.event.inputs.DEVICE_TREE_URL, 'git@github.com') ||
           startsWith(github.event.inputs.COMMON_TREE_URL, 'git@github.com') }}
       uses: webfactory/ssh-agent@v0.5.4
@@ -100,20 +105,27 @@ jobs:
         chmod a+x ~/bin/repo
         sudo ln -sf ~/bin/repo /usr/bin/repo
       
-    - name: Initialize repo
+    - name: Maximize build space
       run: |
-        mkdir workspace
+        # fox_14.1 needs ~85GB; trim the preinstalled toolchains first.
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell || true
+        df -h || true
+
+    - name: Sync OrangeFox sources
+      run: |
+        mkdir -p workspace
         cd workspace
-        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
         git config --global user.name "Nico170420"
         git config --global user.email "b170420nc@gmail.com"
-        repo init --depth=1 -u ${{ github.event.inputs.MANIFEST_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
+        # Official OrangeFox sync: pulls the matching TWRP minimal manifest, applies
+        # the OrangeFox manifest/vold/update_engine/vendor-twrp patches, then clones
+        # bootable/recovery (fox_<branch>) and vendor/recovery (fox_<branch>).
+        # Do NOT hand-clone vendor/orangefox on top of this.
+        git clone --depth=1 ${{ github.event.inputs.SYNC_URL }} ofox-sync
+        FOX_DIR="$GITHUB_WORKSPACE/workspace/fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
+        bash ofox-sync/orangefox_sync.sh --branch ${{ github.event.inputs.MANIFEST_BRANCH }} --path "$FOX_DIR"
+        echo "workspace-folder=$FOX_DIR" >> $GITHUB_OUTPUT
       id: pwd
-          
-    - name: Repo Sync
-      run: |
-        repo sync -j$(nproc --all) --force-sync
-      working-directory: workspace
       
     - name: Clone device tree
       run: |
@@ -128,17 +140,27 @@ jobs:
         git clone ${{ github.event.inputs.COMMON_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.COMMON_PATH }}
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
-    - name: Check Build Tree
-      uses: haya14busa/action-cond@v1
-      id: buildtree
-      with:
-        cond: ${{ github.event.inputs.MANIFEST_BRANCH == 'twrp-11' || github.event.inputs.MANIFEST_BRANCH == 'twrp-12.1' }}
-        if_true: twrp
-        if_false: omni
+    - name: Apply device tree patches
+      run: |
+        # apply-patches.sh must run from the OrangeFox source root; it is a
+        # no-op while patches/recovery/ holds no *.patch files.
+        if [ -f ${{ github.event.inputs.DEVICE_PATH }}/apply-patches.sh ]; then
+          chmod +x ${{ github.event.inputs.DEVICE_PATH }}/apply-patches.sh
+          sh ${{ github.event.inputs.DEVICE_PATH }}/apply-patches.sh
+        fi
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Sync Device Dependencies
       run: |
-        bash ${GITHUB_WORKSPACE}/scripts/convert.sh ${{ github.event.inputs.DEVICE_PATH }}/${{ steps.buildtree.outputs.value }}.dependencies
+        # OrangeFox device trees ship omni_<codename>.dependencies (older) or
+        # twrp_<codename>.dependencies; convert whichever is present.
+        for dep in omni twrp; do
+          f="${{ github.event.inputs.DEVICE_PATH }}/$dep.dependencies"
+          if [ -f "$f" ]; then
+            bash ${GITHUB_WORKSPACE}/scripts/convert.sh "$f"
+            break
+          fi
+        done
         repo sync -j$(nproc --all)
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       continue-on-error: true
@@ -148,25 +170,43 @@ jobs:
       with:
         swap-size-gb: 12
 
-    - name: Building recovery
+    - name: Building OrangeFox
       run: |
         source build/envsetup.sh
+        export LC_ALL=C
         export ALLOW_MISSING_DEPENDENCIES=true
-        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng && make clean && make recoveryimage vendorbootimage -j$(nproc --all)
+        # FOX_* / OF_* variables MUST be exported here (they are ignored in .mk files).
+        export FOX_BUILD_DEVICE=${{ github.event.inputs.DEVICE_NAME }}
+        export FOX_BUILD_TYPE=Unofficial
+        # pd2415 is a virtual A/B device carrying recovery in vendor_boot.
+        export FOX_AB_DEVICE=1
+        export FOX_VIRTUAL_AB_DEVICE=1
+        # The tree ships a prebuilt kernel -> avoid the "NO KERNEL CONFIG" error.
+        export OF_FORCE_PREBUILT_KERNEL=1
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+        make clean
+        make ${{ github.event.inputs.BUILD_TARGET }} -j$(nproc --all)
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Check the output directory before uploading
+      run: |
+        OUT_DIR=workspace/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}
+        ls -all "$OUT_DIR" || true
+        find "$OUT_DIR" -maxdepth 1 -name "OrangeFox-*" -o -maxdepth 1 -name "vendor_boot.img" || true
 
     - name: Upload to Release
       uses: softprops/action-gh-release@v1
       with:
-        files: | 
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/recovery.img
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/vendor_boot.img
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+        files: |
+          workspace/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox-*.img
+          workspace/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox-*.zip
+          workspace/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/vendor_boot.img
+          workspace/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/recovery.img
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
         tag_name: ${{ github.run_id }}
         body: |
-          Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
+          OrangeFox branch: fox_${{ github.event.inputs.MANIFEST_BRANCH }}
           Device: ${{ github.event.inputs.DEVICE_NAME }}
-          Target: recovery.img + vendor_boot.img
+          Target: ${{ github.event.inputs.BUILD_TARGET }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
