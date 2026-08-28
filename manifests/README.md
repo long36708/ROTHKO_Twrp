@@ -60,6 +60,12 @@ fox_12.1 的清单**尚未生成**——当前设备只用 14.1，需要时按�
 
 > 命中后若存在同名 `.sha256`，会先 `sha256sum --check --strict` 校验清单完整性。
 
+> **换行符陷阱**：`.gitattributes` 的 `* text=auto` 会在提交时把 CRLF 归一化为
+> LF，仓库里存的和 CI 检出的都是 **LF 内容**。所以 `.sha256` 必须按 LF 计算
+> —— 在 Windows 上直接对 CRLF 工作区文件求哈希，记录的值与 Linux 检出的文件
+> 不匹配，`sha256sum --check` 必然失败。`generate-pinned-manifest.sh` 已用
+> `tr -d '\r'` 归一化，手工生成时也要照做。
+
 ## 桥接两种方式
 
 | | `orangefox_sync.sh`（默认） | pinned manifest |

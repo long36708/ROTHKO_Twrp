@@ -82,12 +82,21 @@ if [[ -n "${OFOX_SYNC_DIR:-}" && -d "$OFOX_SYNC_DIR" ]]; then
   echo "sync revision: $(cat "$sync_revision_file")"
 fi
 
+# .gitattributes 的 `* text=auto` 会在提交时把 CRLF 归一化为 LF, 因此仓库里
+# 存的、CI 检出的是 LF 内容。必须针对规范化后的内容计算校验和:
+# 在 Windows 上直接对 CRLF 工作区文件求哈希, 记录的值会与 Linux 检出不一致,
+# CI 的 `sha256sum --check --strict` 就会失败。
+normalize_dir="$(mktemp -d)"
+trap 'rm -rf "$normalize_dir"' EXIT
+tr -d '\r' <"$OUT" >"$normalize_dir/$(basename "$OUT")"
 (
-  cd "$MANIFESTS_DIR"
-  sha256sum "orangefox-fox_${BRANCH}-pinned.xml" \
-    >"orangefox-fox_${BRANCH}-pinned.xml.sha256"
+  cd "$normalize_dir"
+  sha256sum "$(basename "$OUT")" \
+    >"$MANIFESTS_DIR/$(basename "$OUT").sha256"
 )
-cat "$MANIFESTS_DIR/orangefox-fox_${BRANCH}-pinned.xml.sha256"
+rm -rf "$normalize_dir"
+trap - EXIT
+cat "$MANIFESTS_DIR/$(basename "$OUT").sha256"
 
 cat <<EOF
 
