@@ -709,11 +709,55 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # 自动提取失败真因, 省去在海量并行日志里人工翻找。
+      - name: Diagnose build failure
+        if: ${{ steps.build.outputs.build-status == 'failed' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$GITHUB_WORKSPACE/orangefox-build.log"
+          product="$ORANGEFOX_TOP/out/target/product/${{ github.event.inputs.DEVICE_NAME }}"
+
+          echo "::group::[1/4] ninja FAILED 目标及失败命令"
+          if [[ -f "$log" ]]; then
+            # ninja 先打印 "FAILED: <target>", 紧接着是被中断的命令
+            grep -n -A 12 '^FAILED' "$log" | head -150 || echo "(未找到 FAILED 行)"
+          else
+            echo "(无构建日志)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::[2/4] 常见错误关键字扫描"
+          if [[ -f "$log" ]]; then
+            grep -n -i -E 'error:|error [0-9]+|No such file or directory|No rule to make|exceed|too large|out of|undefined|not defined' \
+              "$log" | head -80 || echo "(未匹配到常见错误关键字)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::[3/4] vendor_boot 相关产物大小"
+          if [[ -d "$product" ]]; then
+            ls -la "$product" 2>/dev/null \
+              | grep -E 'vendor_boot|ramdisk|recovery|dtb|kernel' || echo "(无相关产物)"
+            echo "--- 分区上限 ---"
+            echo "BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE 见下方配置"
+          else
+            echo "(out 目录不存在)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::[4/4] 设备树 boot/vendor_boot 配置"
+          bc="$ORANGEFOX_TOP/${{ github.event.inputs.DEVICE_PATH }}/BoardConfig.mk"
+          if [[ -f "$bc" ]]; then
+            grep -n -E 'PARTITION_SIZE|MKBOOTIMG|RAMDISK|RECOVERY|BOOT_HEADER|PREBUILT' \
+              "$bc" || echo "(无匹配配置)"
+          fi
+          echo "::endgroup::"
+
       - name: Fail build if a target failed
         if: ${{ steps.build.outputs.build-status == 'failed' }}
         shell: bash
         run: |
-          echo "::error::至少一个构建目标失败, 详见构建日志中的 TARGET FAILED 段落"
+          echo "::error::至少一个构建目标失败, 详见上方 Diagnose build failure 输出"
           exit 1
 
       - name: Clean build worktree
