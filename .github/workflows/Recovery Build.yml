@@ -454,6 +454,16 @@ jobs:
             "$GITHUB_WORKSPACE/device-tree/" \
             "$ORANGEFOX_TOP/${{ github.event.inputs.DEVICE_PATH }}/"
 
+          # 兜底补执行位。设备树在 Windows 上开发, git 默认 core.filemode=false,
+          # 会忽略执行位变化, 脚本可能以 100644 提交。AOSP 构建会直接执行
+          # <device>/recovery/prepare-ramdisk.sh 等脚本, 缺少执行位时报错:
+          #   /bin/bash: line 1: device/.../prepare-ramdisk.sh: Permission denied
+          # 这个坑在 Windows 上完全看不出来, 只在 Linux CI 暴露, 故在此兜底。
+          echo "::group::修正设备树脚本执行位"
+          find "$ORANGEFOX_TOP/${{ github.event.inputs.DEVICE_PATH }}" \
+            -type f -name '*.sh' -print -exec chmod +x {} \; || true
+          echo "::endgroup::"
+
       - name: Clone common tree
         if: ${{ github.event.inputs.COMMON_TREE_URL != '' && github.event.inputs.COMMON_PATH != '' }}
         shell: bash
