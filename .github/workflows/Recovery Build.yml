@@ -517,6 +517,7 @@ jobs:
           df -h "$GITHUB_WORKSPACE"
 
       - name: Building OrangeFox
+        id: build
         shell: bash
         working-directory: ${{ env.ORANGEFOX_TOP }}
         env:
@@ -554,11 +555,39 @@ jobs:
           set +u
           source build/envsetup.sh
           lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
-          make ${{ github.event.inputs.BUILD_TARGET }} -j"$build_jobs" 2>&1 | \
-            tee "$GITHUB_WORKSPACE/orangefox-build.log"
+
+          # 逐个目标分别构建, 不用一条 `make A B -j`。
+          # 合并构建时并行输出会互相淹没, 定位不到是哪个目标失败; 分开后
+          # 每个目标有独立日志, 且已成功的目标产出能保留并被收集上传。
+          build_target_log="$GITHUB_WORKSPACE/orangefox-build.log"
+          : > "$build_target_log"
+
+          target_status="success"
+          for target in ${{ github.event.inputs.BUILD_TARGET }}; do
+            echo "===== BUILD TARGET: $target =====" | tee -a "$build_target_log"
+            if make "$target" -j"$build_jobs" 2>&1 | tee -a "$build_target_log"; then
+              echo "===== TARGET OK: $target =====" | tee -a "$build_target_log"
+            else
+              echo "===== TARGET FAILED: $target =====" | tee -a "$build_target_log"
+              target_status="failed"
+              # vendorbootimage 是后续 package-vendor-boot.sh 的输入
+              # (BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT=true), 失败则
+              # 无需继续; recoveryimage 失败则整体无意义。两者皆不可降级。
+              break
+            fi
+          done
+
+          if [[ "$target_status" != "success" ]]; then
+            echo "::error::构建目标失败, 详见日志中的 TARGET FAILED 段落"
+          fi
 
           kill "$heartbeat_pid" 2>/dev/null || true
           trap - EXIT
+
+          # 本步骤刻意不失败: 把结果写入输出, 先让产物收集与上传步骤执行,
+          # 再由末尾的 "Fail build if a target failed" 判定。否则一个目标失败
+          # 会让整个 job 立刻中断, 已成功构建的镜像全部丢失。
+          echo "build-status=$target_status" >> "$GITHUB_OUTPUT"
 
       - name: Report compiler cache
         if: always()
@@ -627,6 +656,13 @@ jobs:
           path: orangefox-build.log
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Fail build if a target failed
+        if: ${{ steps.build.outputs.build-status == 'failed' }}
+        shell: bash
+        run: |
+          echo "::error::至少一个构建目标失败, 详见构建日志中的 TARGET FAILED 段落"
+          exit 1
 
       - name: Clean build worktree
         if: always()
