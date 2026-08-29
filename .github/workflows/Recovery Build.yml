@@ -563,10 +563,12 @@ jobs:
           : > "$build_target_log"
 
           target_status="success"
+          built_targets=""
           for target in ${{ github.event.inputs.BUILD_TARGET }}; do
             echo "===== BUILD TARGET: $target =====" | tee -a "$build_target_log"
             if make "$target" -j"$build_jobs" 2>&1 | tee -a "$build_target_log"; then
               echo "===== TARGET OK: $target =====" | tee -a "$build_target_log"
+              built_targets="$built_targets $target"
             else
               echo "===== TARGET FAILED: $target =====" | tee -a "$build_target_log"
               target_status="failed"
@@ -588,6 +590,33 @@ jobs:
           # 再由末尾的 "Fail build if a target failed" 判定。否则一个目标失败
           # 会让整个 job 立刻中断, 已成功构建的镜像全部丢失。
           echo "build-status=$target_status" >> "$GITHUB_OUTPUT"
+          echo "built-targets=$(echo "$built_targets" | tr ' ' '\n' | grep -v '^$' | paste -sd, - || true)" >> "$GITHUB_OUTPUT"
+
+      # 前置: vendorbootimage 必须成功。脚本读取的正是它的产物
+      # out/target/product/pd2415/vendor_boot.img (见脚本第 170 行)。
+      - name: Package vendor_boot image
+        id: package_vendor_boot
+        if: ${{ contains(steps.build.outputs.built-targets, 'vendorbootimage') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          script="$ORANGEFOX_TOP/${{ github.event.inputs.DEVICE_PATH }}/package-vendor-boot.sh"
+          if [[ ! -f "$script" ]]; then
+            echo "::warning::设备树未提供 package-vendor-boot.sh, 跳过最终镜像组装"
+            exit 0
+          fi
+          # 输出目录必须在 $GITHUB_WORKSPACE 内:
+          # 脚本会用 mktemp -d 在输出目录下建临时工作区, 源码分区更紧张。
+          final_dir="$GITHUB_WORKSPACE/final"
+          mkdir -p "$final_dir"
+          final_image="$final_dir/${{ github.event.inputs.DEVICE_NAME }}-vendor-boot.img"
+
+          echo "::group::组装最终 vendor_boot 镜像"
+          sh "$script" "$ORANGEFOX_TOP" "$final_image"
+          echo "::endgroup::"
+
+          ls -all "$final_dir"
+          echo "final-image=$final_image" >> "$GITHUB_OUTPUT"
 
       - name: Report compiler cache
         if: always()
@@ -607,16 +636,29 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
 
           shopt -s nullglob
-          images=("$product"/OrangeFox-*.img "$product"/OrangeFox-*.zip "$product"/vendor_boot.img "$product"/recovery.img)
+          images=("$product"/OrangeFox-*.img "$product"/OrangeFox-*.zip "$product"/recovery.img)
           shopt -u nullglob
-          if [[ "${#images[@]}" -eq 0 ]]; then
-            echo "::error::$product 下没有找到任何产物镜像"
-            ls -all "$product"
-            exit 1
-          fi
           for image in "${images[@]}"; do
             cp -fp "$image" "$GITHUB_WORKSPACE/artifacts/"
           done
+
+          # 最终可刷镜像优先。对虚拟 A/B 设备 (recovery 打包在 vendor_boot
+          # 内, BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT=true), 只有经
+          # package-vendor-boot.sh 组装的这一版才是完整可用的; 下面那个
+          # vendor_boot.img 缺少平台 ramdisk 片段与 AVB 尾。
+          if [[ -f "${{ steps.package_vendor_boot.outputs.final-image }}" ]]; then
+            cp -fp "${{ steps.package_vendor_boot.outputs.final-image }}" \
+              "$GITHUB_WORKSPACE/artifacts/"
+          elif [[ -f "$product/vendor_boot.img" ]]; then
+            echo "::warning::未生成最终组装镜像, 退回收录未组装的 vendor_boot.img"
+            cp -fp "$product/vendor_boot.img" "$GITHUB_WORKSPACE/artifacts/"
+          fi
+
+          if [[ -z "$(ls -A "$GITHUB_WORKSPACE/artifacts")" ]]; then
+            echo "::error::没有收集到任何产物"
+            ls -all "$product"
+            exit 1
+          fi
           (
             cd "$GITHUB_WORKSPACE/artifacts"
             sha256sum * > sha256sums.txt
@@ -629,6 +671,16 @@ jobs:
           - Lunch: ${{ github.event.inputs.MAKEFILE_NAME }}-eng
           - Target: ${{ github.event.inputs.BUILD_TARGET }}
           - Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          Files:
+
+          - \`OrangeFox-*.img\` — recovery 镜像 (TWRP/OrangeFox 官方打包)
+          - \`OrangeFox-*.zip\` — recovery 刷机包
+          - \`${{ github.event.inputs.DEVICE_NAME }}-vendor-boot.img\` — **最终可刷镜像**。
+            由 \`package-vendor-boot.sh\` 组装: 平台 ramdisk 片段 + recovery 片段 +
+            DTB, 并追加 AVB hash footer。虚拟 A/B 设备请刷这一个。
+          - \`vendor_boot.img\` — 仅当上述组装未完成时才有, 缺少平台片段与 AVB 尾,
+            不可直接刷入。
           EOF
           ls -all "$GITHUB_WORKSPACE/artifacts"
 
@@ -673,6 +725,7 @@ jobs:
             "$GITHUB_WORKSPACE/ofox-sync" \
             "$GITHUB_WORKSPACE/pinned-manifest" \
             "$GITHUB_WORKSPACE/artifacts" \
+            "$GITHUB_WORKSPACE/final" \
             "$GITHUB_WORKSPACE/ci-gitconfig"
 
   release:
