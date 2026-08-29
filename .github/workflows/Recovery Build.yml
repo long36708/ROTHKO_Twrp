@@ -489,7 +489,6 @@ jobs:
       - name: Sync Device Dependencies
         shell: bash
         working-directory: ${{ env.ORANGEFOX_TOP }}
-        continue-on-error: true
         run: |
           set -euo pipefail
           # 必须在删除 .repo 之前完成; omni_*.dependencies / twrp_*.dependencies 二者取其一。
@@ -527,7 +526,6 @@ jobs:
           df -h "$GITHUB_WORKSPACE"
 
       - name: Building OrangeFox
-        id: build
         shell: bash
         working-directory: ${{ env.ORANGEFOX_TOP }}
         env:
@@ -568,45 +566,34 @@ jobs:
 
           # 逐个目标分别构建, 不用一条 `make A B -j`。
           # 合并构建时并行输出会互相淹没, 定位不到是哪个目标失败; 分开后
-          # 每个目标有独立日志, 且已成功的目标产出能保留并被收集上传。
+          # 每个目标有独立日志, 便于定位失败目标。
           build_target_log="$GITHUB_WORKSPACE/orangefox-build.log"
           : > "$build_target_log"
 
-          target_status="success"
-          built_targets=""
           for target in ${{ github.event.inputs.BUILD_TARGET }}; do
             echo "===== BUILD TARGET: $target =====" | tee -a "$build_target_log"
             if make "$target" -j"$build_jobs" 2>&1 | tee -a "$build_target_log"; then
               echo "===== TARGET OK: $target =====" | tee -a "$build_target_log"
-              built_targets="$built_targets $target"
             else
               echo "===== TARGET FAILED: $target =====" | tee -a "$build_target_log"
-              target_status="failed"
-              # vendorbootimage 是后续 package-vendor-boot.sh 的输入
-              # (BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT=true), 失败则
-              # 无需继续; recoveryimage 失败则整体无意义。两者皆不可降级。
-              break
+              echo "::error::构建目标 $target 失败, 详见上方日志中的 TARGET FAILED 段落"
+              kill "$heartbeat_pid" 2>/dev/null || true
+              trap - EXIT
+              # 构建失败立即失败退出: 不掩盖失败, 也不继续执行后续步骤。
+              exit 1
             fi
           done
 
-          if [[ "$target_status" != "success" ]]; then
-            echo "::error::构建目标失败, 详见日志中的 TARGET FAILED 段落"
-          fi
-
           kill "$heartbeat_pid" 2>/dev/null || true
           trap - EXIT
-
-          # 本步骤刻意不失败: 把结果写入输出, 先让产物收集与上传步骤执行,
-          # 再由末尾的 "Fail build if a target failed" 判定。否则一个目标失败
-          # 会让整个 job 立刻中断, 已成功构建的镜像全部丢失。
-          echo "build-status=$target_status" >> "$GITHUB_OUTPUT"
-          echo "built-targets=$(echo "$built_targets" | tr ' ' '\n' | grep -v '^$' | paste -sd, - || true)" >> "$GITHUB_OUTPUT"
 
       # 前置: vendorbootimage 必须成功。脚本读取的正是它的产物
       # out/target/product/pd2415/vendor_boot.img (见脚本第 170 行)。
       - name: Package vendor_boot image
         id: package_vendor_boot
-        if: ${{ contains(steps.build.outputs.built-targets, 'vendorbootimage') }}
+        # 构建失败时本步骤会自动跳过; 此条件仅用于排除 BUILD_TARGET 未包含
+        # vendorbootimage 的情形。
+        if: ${{ contains(github.event.inputs.BUILD_TARGET, 'vendorbootimage') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -721,7 +708,7 @@ jobs:
 
       # 自动提取失败真因, 省去在海量并行日志里人工翻找。
       - name: Diagnose build failure
-        if: ${{ steps.build.outputs.build-status == 'failed' }}
+        if: failure()
         shell: bash
         run: |
           set -euo pipefail
@@ -762,13 +749,6 @@ jobs:
               "$bc" || echo "(无匹配配置)"
           fi
           echo "::endgroup::"
-
-      - name: Fail build if a target failed
-        if: ${{ steps.build.outputs.build-status == 'failed' }}
-        shell: bash
-        run: |
-          echo "::error::至少一个构建目标失败, 详见上方 Diagnose build failure 输出"
-          exit 1
 
       - name: Clean build worktree
         if: always()
