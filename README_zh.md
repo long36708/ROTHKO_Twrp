@@ -112,6 +112,17 @@ cat ssh_host_ed25519_key
 
 #### 11. 填写完成后，点击 'Run workflow' 开始运行
 
+> ⚠️ **不要用 "Re-run job"（重新运行任务）来应用新提交**
+>
+> GitHub 的 Re-run 会**复用原运行时的 commit SHA**，不会拉取最新代码。
+> 结果是新推送的修复完全不生效，你会对着一个早已修好的错误反复排查。
+>
+> 每次修改代码后，都要回到 **Run workflow** 重新触发。
+>
+> 判断是否生效：查看日志里的 **Report source versions** 步骤，它会打印
+> 实际使用的 `builder` 与 `device` 两个仓库的 commit SHA 和提交时间，
+> 与本地 `git log` 比对即可确认。
+
 -----
 
 ## 编译结果

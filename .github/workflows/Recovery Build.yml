@@ -150,6 +150,40 @@ jobs:
             git -C "$GITHUB_WORKSPACE/device-tree" lfs pull
           fi
 
+      - name: Report source versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 必须显式打印实际使用的 commit。GitHub 的 "Re-run job" 会复用原运行
+          # 的 commit SHA, 不拉新提交; 若只看分支名, 会误以为在跑最新代码,
+          # 从而对着已修复的问题反复排查。
+          echo "::group::实际使用的代码版本"
+          echo -n "builder   : "
+          git -C "$GITHUB_WORKSPACE/builder" rev-parse HEAD
+          git -C "$GITHUB_WORKSPACE/builder" --no-pager log -1 --format='   %ci  %s'
+          echo -n "device    : "
+          git -C "$GITHUB_WORKSPACE/device-tree" rev-parse HEAD
+          git -C "$GITHUB_WORKSPACE/device-tree" --no-pager log -1 --format='   %ci  %s'
+          echo "::endgroup::"
+
+          # 设备树关键文件自检: 缺失时在这里就停, 而不是等到 sepolicy 编译失败。
+          dt="$GITHUB_WORKSPACE/device-tree"
+          for f in Android.mk AndroidProducts.mk BoardConfig.mk \
+                   recovery/prepare-ramdisk.sh recovery.fstab; do
+            if [[ ! -f "$dt/$f" ]]; then
+              echo "::warning::设备树缺少 $f"
+            fi
+          done
+          if [[ -d "$dt/sepolicy" ]]; then
+            echo "sepolicy 文件: $(ls "$dt/sepolicy")"
+            # 打印 genfs_contexts 的 genfscon 行, 便于核对类型是否都已声明
+            if [[ -f "$dt/sepolicy/genfs_contexts" ]]; then
+              grep -n '^genfscon' "$dt/sepolicy/genfs_contexts" || echo "  (无 genfscon 条目)"
+            fi
+          else
+            echo "::warning::设备树没有 sepolicy/ 目录"
+          fi
+
       - name: Setup build swap
         shell: bash
         run: |
