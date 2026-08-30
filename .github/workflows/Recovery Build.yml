@@ -765,7 +765,7 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
 
           shopt -s nullglob
-          images=("$product"/OrangeFox-*.img "$product"/OrangeFox-*.zip "$product"/recovery.img)
+          images=("$product"/OrangeFox-*.img "$product"/OrangeFox-*.zip)
           shopt -u nullglob
           skipped=()
           for image in "${images[@]}"; do
@@ -783,6 +783,12 @@ jobs:
             esac
             cp -fp "$image" "$GITHUB_WORKSPACE/artifacts/"
           done
+          # recovery.img 只在非虚拟 A/B 设备 (BOARD_USES_RECOVERY_AS_BOOT=true)
+          # 才产出。pd2415 是 TARGET_NO_RECOVERY=true 的虚拟 A/B 设备, 根本不产
+          # recovery.img, 缺失属正常, 不可当作致命错误 (否则 set -e 直接退出)。
+          if [[ -f "$product/recovery.img" ]]; then
+            cp -fp "$product/recovery.img" "$GITHUB_WORKSPACE/artifacts/"
+          fi
           if [[ "${#skipped[@]}" -gt 0 ]]; then
             echo "::warning::以下产物内无可刷镜像, 判定为打包空壳, 未收录: ${skipped[*]}"
           fi
