@@ -22,7 +22,7 @@ on:
       MANIFEST_BRANCH:
         description: '橙狐源码分支'
         required: true
-        default: '12.1'
+        default: '14.1'
         type: choice
         options:
           - '14.1'
@@ -56,7 +56,11 @@ on:
       BUILD_TARGET:
         description: 'BUILD_TARGET (make 目标, 空格分隔)'
         required: true
-        default: 'recoveryimage vendorbootimage'
+        # PD2415 是 TARGET_NO_RECOVERY=true 的虚拟 A/B 设备, recovery 打进
+        # vendor_boot, 由 package-vendor-boot.sh 组装最终镜像。OrangeFox 14.1 文档
+        # 对 vendor_boot-as-recovery 只构建 vendorbootimage, 不构建 recoveryimage
+        # (后者在 14.1 上无此顶级目标, 跑了会 "No rule to make target" 直接失败)。
+        default: 'vendorbootimage'
       JAVA_VERSION:
         description: 'JAVA_VERSION (fox_14.1 用 17, fox_12.1 用 11)'
         required: true

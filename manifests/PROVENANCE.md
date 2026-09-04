@@ -8,7 +8,7 @@
 F:\learn-front\learn-hook\vivo-twrp\orangefox_twrp_device_xiaomi_rodin\manifests\orangefox-fox_14.1-pinned.xml
 ```
 
-SHA-256：`62f1427fe6c71f2037ea92dbe7f559383b55d5eeab703c4cd59ecaabb1a63b1d`
+SHA-256：`7262c93f87eaecaa11e6cfde06a7be22b4bb81697d94e74c8c01500ab90a3f60`
 
 ## 为什么可以直接复用
 
