@@ -250,6 +250,32 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 修复 "unsupported checkout state": repo 浅克隆 (--depth=1) 同步中途网络
+          # 中断后, 个别项目的 .git 会进入 repo 无法自愈的损坏状态, 普通 repo sync
+          # 重试必然再次撞同一个坏状态 (典型就是 bootable/recovery)。唯一可靠的恢复
+          # 是删掉该项目的工作树与 .repo 存储, 让 repo 重新克隆。下面两路同步失败
+          # 时都会调用它解析坏项目并清理, 再重试。
+          recover_bad_projects() {
+            local log="$1"
+            [[ -f "$log" ]] || return 0
+            local paths
+            # 1) 直接匹配 "OrangeFox/<path>/.git: unsupported checkout state"
+            paths="$(grep -oE 'OrangeFox/[^ ]+/\.git' "$log" \
+                      | sed -E 's#^OrangeFox/##; s#/\.git$##' | sort -u)"
+            # 2) 兜底匹配 "Failing repos (checkout):" 段列出的项目名
+            if [[ -z "$paths" ]]; then
+              paths="$(sed -n '/Failing repos/,/^$/p' "$log" \
+                        | grep -vE 'Failing repos|^$' | tr -d ':' | sort -u)"
+            fi
+            [[ -z "$paths" ]] && return 0
+            for p in $paths; do
+              echo "  purging bad project: $p"
+              rm -rf "$ORANGEFOX_TOP/$p"
+              rm -rf "$ORANGEFOX_TOP/.repo/projects/$p.git"
+              rm -rf "$ORANGEFOX_TOP/.repo/project-objects/$p.git"
+            done
+          }
+
           # 两种方式:
           #   pinned (默认)   - 用 pinned manifest 锁定 662 个项目的 revision,
           #   再应用本仓库 patches/ 下的配套补丁。可复现, 且补丁已针对该
@@ -339,9 +365,24 @@ jobs:
             heartbeat_pid=$!
             trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
 
-            bash ./orangefox_sync.sh \
-              --branch ${{ github.event.inputs.MANIFEST_BRANCH }} \
-              --path "$ORANGEFOX_TOP"
+            ofox_ok=0
+            for sync_attempt in 1 2 3; do
+              if bash ./orangefox_sync.sh \
+                --branch ${{ github.event.inputs.MANIFEST_BRANCH }} \
+                --path "$ORANGEFOX_TOP" 2>&1 | tee /tmp/ofox-sync.log; then
+                ofox_ok=1
+                break
+              fi
+              echo "::warning::orangefox_sync.sh 第 ${sync_attempt} 次失败, 清理损坏项目后重试"
+              recover_bad_projects /tmp/ofox-sync.log
+              sleep 5
+            done
+            if [[ "$ofox_ok" -ne 1 ]]; then
+              echo "::error::orangefox_sync.sh 三次均失败, 见上方日志" >&2
+              kill "$heartbeat_pid" 2>/dev/null || true
+              trap - EXIT
+              exit 1
+            fi
 
             kill "$heartbeat_pid" 2>/dev/null || true
             trap - EXIT
@@ -359,16 +400,16 @@ jobs:
           trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
 
           sync_succeeded=0
-          for sync_attempt in 1 2 3; do
-            if repo sync -c -j4 --retry-fetches=3 --no-clone-bundle --no-tags --optimized-fetch; then
+          for sync_attempt in 1 2 3 4; do
+            if repo sync -c -j4 --retry-fetches=3 --no-clone-bundle --no-tags --optimized-fetch \
+                 2>&1 | tee /tmp/repo-sync.log; then
               sync_succeeded=1
               break
             fi
-            if [[ "$sync_attempt" -lt 3 ]]; then
-              delay_seconds=$((sync_attempt * 20))
-              echo "::warning::同步第 ${sync_attempt} 次失败, ${delay_seconds}s 后重试。"
-              sleep "$delay_seconds"
-            fi
+            echo "::warning::同步第 ${sync_attempt} 次失败, 清理损坏项目后重试"
+            # 坏状态跨普通重试保留, 必须删掉坏项目的 .git 让 repo 重新克隆。
+            recover_bad_projects /tmp/repo-sync.log
+            sleep 5
           done
           if [[ "$sync_succeeded" -ne 1 ]]; then
             echo "::error::源码同步三次均失败。" >&2
