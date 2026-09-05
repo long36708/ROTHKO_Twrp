@@ -708,14 +708,26 @@ jobs:
 
           echo "::group::ramdisk 载荷自检"
 
-          # 1) prebuilt 里的每个模块都必须出现在 ramdisk 中。只比总数会误判
-          #    (构建系统自身也可能往 lib/modules 塞模块), 故逐个核对。
+          # 1) prebuilt 里的每个 ESSENTIAL 模块都必须出现在 ramdisk 中。
+          #    只比总数会误判 (构建系统自身也可能往 lib/modules 塞模块), 故逐个核对。
+          #    设备树可提供 essential_modules.txt 白名单来控制装哪些模块
+          #    (vendor_boot 有 128MB 分区上限, 337 个全装会超限)。
+          essential_list="$device_dir/prebuilt/recovery_modules/essential_modules.txt"
           shopt -s nullglob
-          prebuilt_modules=("$device_dir"/prebuilt/recovery_modules/*.ko)
+          if [[ -f "$essential_list" ]]; then
+            # 从白名单文件逐行读取, 只校验声明的模块
+            prebuilt_modules=()
+            while IFS= read -r mod || [[ -n "$mod" ]]; do
+              [[ -n "$mod" ]] || continue
+              prebuilt_modules+=("$device_dir/prebuilt/recovery_modules/$mod")
+            done < "$essential_list"
+          else
+            prebuilt_modules=("$device_dir"/prebuilt/recovery_modules/*.ko)
+          fi
           shopt -u nullglob
 
           if [[ "${#prebuilt_modules[@]}" -eq 0 ]]; then
-            echo "::error::设备树 prebuilt/recovery_modules 下没有 .ko"
+            echo "::error::设备树 prebuilt/recovery_modules 下没有 .ko (或 essential_modules.txt 为空)"
             echo "::endgroup::"
             exit 1
           fi
@@ -727,12 +739,12 @@ jobs:
             fi
           done
           if [[ "${#missing[@]}" -gt 0 ]]; then
-            echo "::error::ramdisk 缺少 ${#missing[@]}/${#prebuilt_modules[@]} 个 prebuilt 模块, 例: ${missing[*]:0:5}"
+            echo "::error::ramdisk 缺少 ${#missing[@]}/${#prebuilt_modules[@]} 个 essential 模块, 例: ${missing[*]:0:5}"
             echo "::error::BOARD_RECOVERY_IMAGE_PREPARE (recovery/prepare-ramdisk.sh) 未把载荷装进 recovery root"
             echo "::endgroup::"
             exit 1
           fi
-          echo "内核模块: ${#prebuilt_modules[@]} 个 prebuilt 模块全部就位"
+          echo "内核模块: ${#prebuilt_modules[@]} 个 essential 模块全部就位"
           test -f "$root/lib/modules/modules.dep"
 
           # 2) 清单只作信息输出, **不能**当作钩子执行过的证据:
